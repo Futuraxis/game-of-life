@@ -362,6 +362,155 @@ class Experiment:
             rows.append(row)
         return pd.DataFrame(rows)
 
+# ================= 可视化功能 =================
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+    from IPython.display import HTML  # 用于在 Jupyter Notebook 中显示动画
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("警告: matplotlib 未安装，可视化功能将不可用。请运行 'pip install matplotlib' 安装。")
+
+class Visualizer:
+    """生命游戏可视化工具类"""
+
+    @staticmethod
+    def plot_grid(grid, title=None, ax=None, cmap='gray', show=True):
+        """
+        绘制单个网格（二维数组）
+        :param grid: 二维 numpy 数组 (0/1)
+        :param title: 图像标题
+        :param ax: matplotlib 轴对象，若为 None 则新建
+        :param cmap: 颜色映射，默认 'gray' 显示黑白
+        :param show: 是否立即显示图像
+        :return: 绘制的轴对象
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            print("matplotlib 未安装，无法绘图。")
+            return None
+        if ax is None:
+            _, ax = plt.subplots()
+        ax.imshow(grid, cmap=cmap, interpolation='nearest', vmin=0, vmax=1)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if title:
+            ax.set_title(title)
+        if show:
+            plt.show()
+        return ax
+
+    @staticmethod
+    def plot_cell_counts(counts, title="Cell Count Over Generations", ax=None, show=True):
+        """
+        绘制细胞数量随时间的变化曲线
+        :param counts: 每代细胞数量列表
+        :param title: 图表标题
+        :param ax: 轴对象
+        :param show: 是否立即显示
+        :return: 轴对象
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            print("matplotlib 未安装，无法绘图。")
+            return None
+        if ax is None:
+            _, ax = plt.subplots()
+        ax.plot(counts, linewidth=1.5)
+        ax.set_xlabel("Generation")
+        ax.set_ylabel("Number of live cells")
+        ax.set_title(title)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        if show:
+            plt.show()
+        return ax
+
+    @staticmethod
+    def animate_history(history, interval=200, repeat=True, figsize=(6,6), cmap='gray'):
+        """
+        生成历史网格的动画
+        :param history: 网格历史列表，每个元素为二维 numpy 数组 (代, rows, cols)
+        :param interval: 帧间隔（毫秒）
+        :param repeat: 是否循环播放
+        :param figsize: 图像尺寸
+        :param cmap: 颜色映射
+        :return: matplotlib.animation.FuncAnimation 对象
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            print("matplotlib 未安装，无法生成动画。")
+            return None
+        if len(history) == 0:
+            print("历史记录为空，无法生成动画。")
+            return None
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        img = ax.imshow(history[0], cmap=cmap, interpolation='nearest', vmin=0, vmax=1)
+        title = ax.set_title(f"Generation 0")
+
+        def update(frame):
+            img.set_array(history[frame])
+            title.set_text(f"Generation {frame}")
+            return [img, title]
+
+        ani = animation.FuncAnimation(fig, update, frames=len(history),
+                                      interval=interval, repeat=repeat, blit=True)
+        plt.close(fig)  # 防止额外显示静态图像
+        return ani
+
+    @staticmethod
+    def plot_final_grids(results, max_cols=4, figsize=(12,12), cmap='gray'):
+        """
+        批量显示多个实验的最终网格（子图排列）
+        :param results: Experiment.run_all() 返回的结果列表
+        :param max_cols: 每行最多显示多少个子图
+        :param figsize: 整图尺寸
+        :param cmap: 颜色映射
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            print("matplotlib 未安装，无法绘图。")
+            return
+        n = len(results)
+        if n == 0:
+            print("无实验结果可显示。")
+            return
+        cols = min(max_cols, n)
+        rows = (n + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=figsize)
+        if rows == 1 and cols == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten()
+        for i, res in enumerate(results):
+            ax = axes[i]
+            grid = res['final_grid']
+            ax.imshow(grid, cmap=cmap, interpolation='nearest', vmin=0, vmax=1)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            p = res['config'].get('p', '?')
+            ax.set_title(f"p={p}\ngen={res['generations']}\ncount={res['final_count']}", fontsize=10)
+        # 隐藏多余的子图
+        for j in range(i+1, len(axes)):
+            axes[j].axis('off')
+        plt.tight_layout()
+        plt.show()
+
+    @staticmethod
+    def show_animation_in_notebook(ani):
+        """
+        在 Jupyter Notebook 中显示动画（需要 IPython.display）
+        :param ani: matplotlib.animation.FuncAnimation 对象
+        :return: HTML 对象
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            print("matplotlib 未安装。")
+            return None
+        try:
+            from IPython.display import HTML
+            return HTML(ani.to_jshtml())
+        except ImportError:
+            print("IPython 未安装，无法在 Notebook 中显示动画。")
+            return ani
 
 # ================= 使用示例 =================
 if __name__ == '__main__':
@@ -395,3 +544,29 @@ if __name__ == '__main__':
     df = exp.to_dataframe()
     if df is not None:
         print(df[['cfg_p', 'device', 'parallelism', 'initial', 'final']])
+    
+        # ========== 可视化示例 ==========
+    if MATPLOTLIB_AVAILABLE:
+        # 1. 绘制单个实验的最终网格
+        if results:
+            print("\n显示第一个实验的最终网格：")
+            Visualizer.plot_grid(results[0]['final_grid'], title=f"Final Grid (p={results[0]['config']['p']})")
+
+        # 2. 绘制细胞数量曲线
+        if results and 'cell_counts' in results[0]:
+            print("\n显示第一个实验的细胞数量变化：")
+            Visualizer.plot_cell_counts(results[0]['cell_counts'], title="Cell Counts Over Time")
+
+        # 3. 批量显示最终网格
+        print("\n显示所有实验的最终网格对比：")
+        Visualizer.plot_final_grids(results, max_cols=3)
+
+        # 4. 动画示例（使用第一个实验的历史，若 history 不为空）
+        if results and len(results[0]['history']) > 1:
+            print("\n生成第一个实验的历史动画（将保存为 GIF 或显示在 Notebook 中）...")
+            ani = Visualizer.animate_history(results[0]['history'], interval=100)
+            # 若要保存为 GIF，可取消下一行注释
+            # ani.save('game_of_life.gif', writer='pillow', fps=10)
+            plt.show()  # 在某些环境中需要调用 plt.show() 才能显示动画
+    else:
+        print("请安装 matplotlib 以使用可视化功能。")
