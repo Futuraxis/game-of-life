@@ -4,32 +4,49 @@ import json
 import time
 from copy import deepcopy
 from itertools import product
+import scipy.signal
+import torch
+import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor
 
-class GameOfLife:
-    def __init__(self, p, rows=50, cols=50, survive_rule=(2,3), birth_rule=(3,), boundary='dead'):
-        self.p = p
-        self.rows = rows
-        self.cols = cols
-        self.survive_rule = survive_rule
-        self.birth_rule = birth_rule
-        self.boundary = boundary
-        
-        self.grid = self._initialize_grid()
-        self.generation = 0
-        self.history = [self.grid.copy()]  # 记录初始代
+# 生命游戏 Moore 卷积核
+K = np.asarray([[1,1,1], [1,0,1], [1,1,1]])
+
+class GameOfLife:    
+    def default_evolve(grid):
+        A = grid
+        U = scipy.signal.convolve2d(A, K, mode='same', boundary='wrap')
+        A = (A & (U==2)) | (U==3)
+        return A
     
+    def __init__(self, p, rows=50, cols=50, evolve=default_evolve, boundary='dead'):
+        self.p = p # 生成概率 p
+        self.rows = rows # 网格行数
+        self.cols = cols # 网格列数
+        self.evolve = evolve
+        self.boundary = boundary # 边界条件
+        
+        self.grid = self._initialize_grid() # 当前网格
+        self.generation = 0 # 当前代数
+        self.history = [self.grid.copy()]  # 记录初始代 
+    
+    # 初始化网格
     def _initialize_grid(self):
         return (np.random.rand(self.rows, self.cols) < self.p).astype(np.int8)
     
+    # 获得当前网格
     def get_current_grid(self):
         return self.grid
     
+    # 获得当前代数
     def get_current_generation(self):
         return self.generation
     
+    # 获得历史
     def get_history(self):
         return self.history
     
+    # 获得各参数
     def get_parameters(self):
         return {
             'p': self.p,
@@ -40,28 +57,135 @@ class GameOfLife:
             'boundary': self.boundary
         }
     
+    # 设置当前网格
     def set_grid(self, new_grid):
         self.grid = new_grid.copy()
         self.generation = 0
         self.history = [self.grid.copy()]
     
+    # 增加代数
     def increment_generation(self):
+        # 演化
+        self.grid = self.evolve(self.grid)
+        self.history.append(self.grid)
+
         self.generation += 1
     
+    # 记录历史
     def record(self):
         """记录当前网格到历史"""
         self.history.append(self.grid.copy())
     
+    # 字符串表示
     def __repr__(self):
         return (f"GameOfLife(p={self.p}, size={self.rows}x{self.cols}, "
                 f"gen={self.generation}, rules=({self.survive_rule},{self.birth_rule}))")
 
 class Experiment:
+    @staticmethod
+    def default_evolve_func(game, max_steps=100, single_step=None,
+                            interval=1, computation_info=None, use_history=True, seed = 42): #不知道为啥需要加 seed
+        """
+        通用演化函数：对传入的 `game` 执行最多 `max_steps` 次演化。
+        single_step: 单次演化函数，接受并返回 numpy ndarray（2D）。
+                     若为 None，则使用 GameOfLife.default_evolve。
+        computation_info: dict, e.g. {'device':'CPU'|'GPU', 'parallelism':'single-thread'|'multi-thread', 'workers':int}
+        返回: (cell_counts, final_grid)
+        """
+
+        # 单步函数不存在则设置为默认值
+        if single_step is None:
+            single_step = GameOfLife.default_evolve
+
+        # 获取参数，默认值为：CPU 单线程
+        comp = computation_info or {'device': 'CPU', 'parallelism': 'single-thread'}
+        device = comp.get('device', 'CPU').upper()
+        parallel = comp.get('parallelism', 'single-thread')
+
+        # 获取行数和列数
+        rows, cols = game.rows, game.cols
+
+        # 计算存活细胞数
+        cell_counts = [int(game.grid.sum())]
+
+        # CPU 多线程按行分块计算下一代（带环绕边界）
+        def cpu_next(grid):
+            if parallel != 'multi-thread':
+                return single_step(grid)
+
+            workers = int(comp.get('workers', os.cpu_count() or 1))
+            n_workers = min(max(1, workers), rows)
+            if n_workers <= 1:
+                return single_step(grid)
+
+            # 构建分块区间 [s, e)（行索引）
+            chunk_sizes = [(rows // n_workers) + (1 if i < (rows % n_workers) else 0) for i in range(n_workers)]
+            starts = []
+            cur = 0
+            for sz in chunk_sizes:
+                starts.append((cur, cur + sz))
+                cur += sz
+
+            def compute_chunk(se):
+                s, e = se
+                # 提取包含上下各一行的子网格（环绕取模）
+                idx = [((r) % rows) for r in range(s - 1, e + 1)]
+                sub = grid[idx, :]
+                U = scipy.signal.convolve2d(sub, K, mode='same', boundary='wrap')
+                # 中心区域对应原始 s..e-1 行
+                mid_start = 1
+                mid_len = e - s
+                U_center = U[mid_start: mid_start + mid_len, :]
+                sub_center = sub[mid_start: mid_start + mid_len, :]
+                next_chunk = ((sub_center & (U_center == 2)) | (U_center == 3)).astype(np.int8)
+                return s, next_chunk
+
+            next_grid = np.zeros_like(grid)
+            with ThreadPoolExecutor(max_workers=n_workers) as exe:
+                futures = [exe.submit(compute_chunk, se) for se in starts if se[0] < se[1]]
+                for fut in futures:
+                    s, chunk = fut.result()
+                    next_grid[s: s + chunk.shape[0], :] = chunk
+            return next_grid
+
+        # GPU 版本（使用 torch）
+        def gpu_next(grid):
+            if not torch.cuda.is_available():
+                # Fallback to CPU single-thread
+                return single_step(grid)
+
+            t = torch.from_numpy(grid.astype(np.float32)).unsqueeze(0).unsqueeze(0).to('cuda')
+            # kernel
+            k = torch.tensor(K.astype(np.float32)).unsqueeze(0).unsqueeze(0).to('cuda')
+            # 使用 circular pad 再 conv2d
+            padded = F.pad(t, (1, 1, 1, 1), mode='circular')
+            U = F.conv2d(padded, k)
+            A = (t > 0.5)
+            U = U.squeeze(0).squeeze(0)
+            A = A.squeeze(0).squeeze(0)
+            nextA = ((A & (U == 2)) | (U == 3)).to(torch.uint8)
+            return nextA.cpu().numpy().astype(np.int8)
+
+        # 主循环
+        for step in range(int(max_steps)):
+            if device == 'GPU':
+                next_grid = gpu_next(game.grid)
+            else:
+                next_grid = cpu_next(game.grid)
+
+            game.grid = next_grid.copy()
+            game.generation += 1
+            if use_history and interval and (game.generation % interval == 0):
+                game.history.append(game.grid.copy())
+            cell_counts.append(int(game.grid.sum()))
+
+        return cell_counts, game.grid
+
     """
     批量实验管理器。可对多组参数自动运行生命游戏，收集每代细胞数、最终网格等数据。
     新增功能：记录每次实验的计算方式（CPU/GPU、单线程/多线程）。
     """
-    def __init__(self, configs, evolve_func, save_dir='experiment_data', computation_info=None):
+    def __init__(self, configs, evolve_func=default_evolve_func, save_dir='experiment_data', computation_info=None):
         """
         参数:
             configs : list of dict
@@ -101,9 +225,11 @@ class Experiment:
                   f"size={cfg.get('rows',50)}x{cfg.get('cols',50)}")
 
             # 1. 提取 GameOfLife 参数，补全默认值
+            # 根据计算方式选取evolve函数
+
             game_params = {k: cfg.get(k, default) 
                            for k, default in [('p', None), ('rows',50), ('cols',50),
-                                              ('survive_rule',(2,3)), ('birth_rule',(3,)),
+                                              ('evolve',GameOfLife.default_evolve),
                                               ('boundary','dead')] if k in cfg or k=='p'}
             if 'p' not in game_params:
                 raise ValueError("每个配置必须包含 'p'")
@@ -125,7 +251,8 @@ class Experiment:
 
             # 6. 运行演化
             start = time.time()
-            cell_counts, final_grid = self.evolve_func(game, **evolve_params)
+            # 将本次实验的计算信息传入演化函数
+            cell_counts, final_grid = self.evolve_func(game, computation_info=comp_info, **evolve_params)
             elapsed = time.time() - start
 
             # 7. 记录结果（增加 computation_info 字段）
@@ -238,38 +365,22 @@ class Experiment:
 
 # ================= 使用示例 =================
 if __name__ == '__main__':
-    # 你需要先实现一个真正的演化函数
-    def my_evolve(game, max_steps=100, **kwargs):
-        """
-        示例演化函数（必须替换为真实规则）。
-        这里只演示接口，实际应包含邻居计数和更新逻辑。
-        """
-        counts = [game.grid.sum()]
-        for step in range(max_steps):
-            # 请在此处添加你的 update 代码
-            # new_grid = update(game.grid)  # 需要实现 update
-            # game.grid = new_grid
-            # game.increment_generation()
-            # game.record()
-            # counts.append(game.grid.sum())
-            # 若稳定可提前 break
-            pass
-        return counts, game.grid
-
     # 1. 手动定义几个配置，可以在配置中指定 computation_info
     configs = [
-        {'p': 0.1, 'rows': 30, 'cols': 30, 'max_steps': 50, 'seed': 42,
+        {'p': 0.1, 'rows': 300, 'cols': 300, 'max_steps': 50, 'seed': 42,
          'computation_info': {'device': 'CPU', 'parallelism': 'single-thread'}},
-        {'p': 0.3, 'rows': 30, 'cols': 30, 'max_steps': 50, 'seed': 42,
+        {'p': 0.3, 'rows': 300, 'cols': 300, 'max_steps': 150, 'seed': 42,
          'computation_info': {'device': 'CPU', 'parallelism': 'multi-thread'}},
-        {'p': 0.5, 'rows': 30, 'cols': 30, 'max_steps': 50, 'seed': 42},
+        {'p': 0.5, 'rows': 300, 'cols': 300, 'max_steps': 450, 'seed': 42},
         # 第三个未指定，将使用 Experiment 默认的计算方式
     ]
 
+    print("加载参数...")
     # 2. 创建实验对象，传入默认计算方式
-    exp = Experiment(configs, evolve_func=my_evolve, save_dir='batch_results',
+    exp = Experiment(configs, save_dir='batch_results',
                      computation_info={'device': 'GPU', 'parallelism': 'single-thread'})
 
+    print("开始进行实验")
     # 3. 运行所有实验
     results = exp.run_all(max_steps=100)
 
